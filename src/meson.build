@@ -299,12 +299,22 @@ if host_os_family == 'freebsd'
 endif
 
 if host_os_family == 'qnx'
-  qnx_sources = [
-    'qnx/qnx-host-session.vala',
-    'qnx/qinjector.vala',
-    'qnx/qinjector-glue.c',
-    'qnx/system-qnx.c',
-  ]
+  message('@@@@@@@@host_arch:', host_arch)
+  if host_arch == 'arm64'
+    qnx_sources = [
+      'qnx/qnx-host-session.vala',
+      'qnx/qinjector.vala',
+      'qnx/qinjector-glue-arm64.c',
+      'qnx/system-qnx.c',
+    ]
+  else
+    qnx_sources = [
+      'qnx/qnx-host-session.vala',
+      'qnx/qinjector.vala',
+      'qnx/qinjector-glue.c',
+      'qnx/system-qnx.c',
+    ]
+  endif
   backend_vala_args += ['--pkg=posix']
 endif
 
