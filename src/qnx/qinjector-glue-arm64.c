@@ -203,7 +203,7 @@ _frida_remote_thread_session_thread_is_alive (guint pid, guint tid)
   gint fd;
   procfs_status status;
 
-  path = g_strdup_printf ("/proc/%u", pid);
+  path = g_strdup_printf ("/proc/%u/as", pid);
 
   fd = open (path, O_RDONLY);
   if (fd == -1)
@@ -295,46 +295,47 @@ frida_emit_and_remote_execute (FridaEmitFunc func, const FridaInjectionParams * 
 }
 
 #define EMIT_MOVE(dst, src) \
-    gum_arm_writer_put_mov_reg_reg (&cw, ARM_REG_##dst, ARM_REG_##src)
+    gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_##dst, ARM64_REG_##src)
 #define EMIT_ADD(dst, src, offset) \
-    gum_arm_writer_put_add_reg_reg_imm (&cw, ARM_REG_##dst, ARM_REG_##src, offset)
+    gum_arm64_writer_put_add_reg_reg_imm (&cw, ARM64_REG_##dst, ARM64_REG_##src, offset)
 #define EMIT_LOAD_FIELD(reg, field) \
-    gum_arm_writer_put_ldr_reg_address (&cw, ARM_REG_##reg, FRIDA_REMOTE_DATA_FIELD (field)); \
+    gum_arm64_writer_put_ldr_reg_address (&cw, ARM64_REG_##reg, FRIDA_REMOTE_DATA_FIELD (field)); \
     EMIT_LDR (reg, reg)
 #define EMIT_STORE_FIELD(field, reg) \
-    gum_arm_writer_put_ldr_reg_address (&cw, ARM_REG_R0, FRIDA_REMOTE_DATA_FIELD (field)); \
-    gum_arm_writer_put_str_reg_reg_offset (&cw, ARM_REG_##reg, ARM_REG_R0, 0)
+    gum_arm64_writer_put_ldr_reg_address (&cw, ARM64_REG_X0, FRIDA_REMOTE_DATA_FIELD (field)); \
+    gum_arm64_writer_put_str_reg_reg_offset (&cw, ARM64_REG_##reg, ARM64_REG_X0, 0)
 #define EMIT_LDR(dst, src) \
-    gum_arm_writer_put_ldr_reg_reg_offset (&cw, ARM_REG_##dst, ARM_REG_##src, 0)
+    gum_arm64_writer_put_ldr_reg_reg_offset (&cw, ARM64_REG_##dst, ARM64_REG_##src, 0)
 #define EMIT_LDR_U32(reg, value) \
-    gum_arm_writer_put_ldr_reg_u32 (&cw, ARM_REG_##reg, value)
+    gum_arm64_writer_put_ldr_reg_u32 (&cw, ARM64_REG_##reg, value)
 #define EMIT_CALL_IMM(func, n_args, ...) \
-    gum_arm_writer_put_call_address_with_arguments (&cw, func, n_args, __VA_ARGS__)
+    gum_arm64_writer_put_call_address_with_arguments (&cw, func, n_args, __VA_ARGS__)
 #define EMIT_CALL_REG(reg, n_args, ...) \
-    gum_arm_writer_put_call_reg_with_arguments (&cw, ARM_REG_##reg, n_args, __VA_ARGS__)
+    gum_arm64_writer_put_call_reg_with_arguments (&cw, ARM64_REG_##reg, n_args, __VA_ARGS__)
 #define EMIT_LABEL(name) \
-    gum_arm_writer_put_label (&cw, name)
-#define EMIT_CMP(reg, imm) \
-    gum_arm_writer_put_cmp_reg_imm (&cw, ARM_REG_##reg, imm)
+    gum_arm64_writer_put_label (&cw, name)
+#define EMIT_CMP(reg1, reg2) \
+    gum_arm64_writer_put_cmp_reg_reg (&cw, ARM64_REG_##reg1, ARM64_REG_##reg2)
 #define EMIT_B_COND(cond, label) \
-    gum_arm_writer_put_b_cond_label (&cw, ARM_CC_##cond, label)
+    gum_arm64_writer_put_b_cond_label (&cw, ARM64_CC_##cond, label)
 
 #define ARG_IMM(value) \
     GUM_ARG_ADDRESS, GUM_ADDRESS (value)
 #define ARG_REG(reg) \
-    GUM_ARG_REGISTER, ARM_REG_##reg
+    GUM_ARG_REGISTER, ARM64_REG_##reg
 
 static void
 frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_address, FridaCodeChunk * code)
 {
-  GumArmWriter cw;
+  GumArm64Writer cw;
   const gchar * skip_dlopen = "skip_dlopen";
   const gchar * skip_dlclose = "skip_dlclose";
   const gchar * skip_detach = "skip_detach";
 
-  gum_arm_writer_init (&cw, code->cur);
+  gum_arm64_writer_init (&cw, code->cur);
 
-  gum_arm_writer_put_push_regs (&cw, 4, ARM_REG_R5, ARM_REG_R6, ARM_REG_R7, ARM_REG_LR);
+  gum_arm64_writer_put_push_reg_reg(&cw, ARM64_REG_X5, ARM64_REG_X6);
+  gum_arm64_writer_put_push_reg_reg(&cw, ARM64_REG_X7, ARM64_REG_LR);
 
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "ConnectAttach_r"),
       5,
@@ -343,88 +344,92 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
       ARG_IMM (params->channel_id),
       ARG_IMM (_NTO_SIDE_CHANNEL),
       ARG_IMM (_NTO_COF_CLOEXEC));
-  EMIT_MOVE (R7, R0);
+  EMIT_MOVE (X7, X0);
 
-  gum_arm_writer_put_call_address_with_arguments (&cw, frida_resolve_remote_libc_function (params->pid, "gettid"), 0);
-  EMIT_MOVE (R3, R0);
+  gum_arm64_writer_put_call_address_with_arguments (&cw, frida_resolve_remote_libc_function (params->pid, "gettid"), 0);
+  EMIT_MOVE (X3, X0);
 
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "MsgSendPulse_r"),
       4,
-      ARG_REG (R7),
+      ARG_REG (X7),
       ARG_IMM (-1),
       ARG_IMM (FRIDA_QNX_PULSE_CODE_HELLO),
-      ARG_REG (R3));
+      ARG_REG (X3));
 
-  EMIT_LOAD_FIELD (R6, module_handle);
-  EMIT_CMP (R6, 0);
+  EMIT_LOAD_FIELD (X6, module_handle);
+  //EMIT_CMP (R6, 0);
+  EMIT_CMP (X6, XZR);
   EMIT_B_COND (NE, skip_dlopen);
   {
     EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlopen"),
         2,
         ARG_IMM (FRIDA_REMOTE_DATA_FIELD (so_path)),
         ARG_IMM (RTLD_LAZY));
-    EMIT_MOVE (R6, R0);
-    EMIT_STORE_FIELD (module_handle, R6);
+    EMIT_MOVE (X6, X0);
+    EMIT_STORE_FIELD (module_handle, X6);
   }
   EMIT_LABEL (skip_dlopen);
 
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlsym"),
       2,
-      ARG_REG (R6),
+      ARG_REG (X6),
       ARG_IMM (FRIDA_REMOTE_DATA_FIELD (entrypoint_name)));
-  gum_arm_writer_put_mov_reg_reg (&cw, ARM_REG_R5, ARM_REG_R0);
+  gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X5, ARM64_REG_X0);
 
-  EMIT_LDR_U32 (R0, FRIDA_UNLOAD_POLICY_IMMEDIATE);
-  gum_arm_writer_put_push_regs (&cw, 2, ARM_REG_R0, ARM_REG_R7);
-  EMIT_MOVE (R1, SP);
-  EMIT_ADD (R2, SP, 4);
-  EMIT_CALL_REG (R5,
+  EMIT_LDR_U32 (X0, FRIDA_UNLOAD_POLICY_IMMEDIATE);
+  gum_arm64_writer_put_push_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X7);
+  EMIT_MOVE (X1, SP);
+  EMIT_ADD (X2, SP, 4);
+  EMIT_CALL_REG (X5,
       3,
       ARG_IMM (FRIDA_REMOTE_DATA_FIELD (entrypoint_data)),
-      ARG_REG (R1),
-      ARG_REG (R2));
+      ARG_REG (X1),
+      ARG_REG (X2));
 
-  EMIT_LDR (R0, SP);
-  EMIT_CMP (R0, FRIDA_UNLOAD_POLICY_IMMEDIATE);
+  EMIT_LDR (X0, SP);
+  EMIT_LDR_U32 (X2, FRIDA_UNLOAD_POLICY_IMMEDIATE);
+  EMIT_CMP (X0, X2);
   EMIT_B_COND (NE, skip_dlclose);
   {
     EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlclose"),
         1,
-        ARG_REG (R6));
+        ARG_REG (X6));
   }
   EMIT_LABEL (skip_dlclose);
 
-  EMIT_LDR (R0, SP);
-  EMIT_CMP (R0, FRIDA_UNLOAD_POLICY_DEFERRED);
+  EMIT_LDR (X0, SP);
+  EMIT_LDR_U32 (X2, FRIDA_UNLOAD_POLICY_DEFERRED);
+  EMIT_CMP (X0, X2);
   EMIT_B_COND (EQ, skip_detach);
   {
-    EMIT_LOAD_FIELD (R0, worker_thread);
+    EMIT_LOAD_FIELD (X0, worker_thread);
     EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "pthread_detach"),
         1,
-        ARG_REG (R0));
+        ARG_REG (X0));
   }
   EMIT_LABEL (skip_detach);
 
-  EMIT_LDR (R3, SP);
+  EMIT_LDR (X3, SP);
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "MsgSendPulse_r"),
       4,
-      ARG_REG (R7),
+      ARG_REG (X7),
       ARG_IMM (-1),
       ARG_IMM (FRIDA_QNX_PULSE_CODE_BYE),
-      ARG_REG (R3));
+      ARG_REG (X3));
 
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "ConnectDetach_r"),
       1,
-      ARG_REG (R7));
+      ARG_REG (X7));
 
-  gum_arm_writer_put_pop_regs (&cw, 2, ARM_REG_R0, ARM_REG_R7);
+  gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X7);
 
-  gum_arm_writer_put_pop_regs (&cw, 4, ARM_REG_R5, ARM_REG_R6, ARM_REG_R7, ARM_REG_PC);
+  gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X7, ARM64_REG_LR);
+  gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X5, ARM64_REG_X6);
 
-  gum_arm_writer_flush (&cw);
-  code->cur = gum_arm_writer_cur (&cw);
-  code->size += gum_arm_writer_offset (&cw);
-  gum_arm_writer_clear (&cw);
+  gum_arm64_writer_flush (&cw);
+  code->cur = gum_arm64_writer_cur (&cw);
+  code->size += gum_arm64_writer_offset (&cw);
+  gum_arm64_writer_clear (&cw);
 }
 
 static GumAddress
@@ -652,40 +657,32 @@ frida_remote_call (pid_t pid, GumAddress func, const GumAddress * args, gint arg
   /*
    * Set the PC to be the function address and SP to the stack address.
    */
-  if ((func & 1) != 0)
+  AARCH64_SET_REGIP(&modified_registers.aarch64, func);
+
+
+  for (i = 0; i < args_length && i < 8; i++)
   {
-    modified_registers.arm.gpr[GUM_QNX_ARM_REG_PC] = (func & ~1);
-    modified_registers.arm.spsr |= PSR_T_BIT;
-  }
-  else
-  {
-    modified_registers.arm.gpr[GUM_QNX_ARM_REG_PC] = func;
-    modified_registers.arm.spsr &= ~PSR_T_BIT;
+    modified_registers.aarch64.gpr[i] = args[i];
   }
 
-  for (i = 0; i < args_length && i < 4; i++)
+  for (i = args_length - 1; i >= 8; i--)
   {
-    modified_registers.arm.gpr[i] = args[i];
-  }
+    modified_registers.aarch64.gpr[AARCH64_REG_SP] -= 8;
 
-  for (i = args_length - 1; i >= 4; i--)
-  {
-    modified_registers.arm.gpr[GUM_QNX_ARM_REG_SP] -= 4;
-
-    if (!frida_remote_write_fd (fd, modified_registers.arm.gpr[GUM_QNX_ARM_REG_SP], &args[i],
-        4, error))
+    if (!frida_remote_write_fd (fd, modified_registers.aarch64.gpr[AARCH64_REG_SP], &args[i],
+        8, error))
       goto beach;
   }
 
   /*
    * Set the LR to be a dummy address which will trigger a pagefault.
    */
-  modified_registers.arm.gpr[GUM_QNX_ARM_REG_LR] = 0xfffffff0;
+  modified_registers.aarch64.gpr[AARCH64_REG_LR] = 0xfffffffffffffff0;
 
   ret = devctl (fd, DCMD_PROC_SETGREG, &modified_registers, sizeof (modified_registers), 0);
   CHECK_OS_RESULT (ret, ==, 0, "DCMD_PROC_SETGREG");
 
-  while (modified_registers.arm.gpr[GUM_QNX_ARM_REG_PC] != 0xfffffff0)
+  while (modified_registers.aarch64.elr != 0xfffffffffffffff0)
   {
     /*
      * Continue the process, watching for FLTPAGE which should trigger when
@@ -713,7 +710,7 @@ frida_remote_call (pid_t pid, GumAddress func, const GumAddress * args, gint arg
   }
 
   if (retval != NULL)
-    *retval = modified_registers.arm.gpr[GUM_QNX_ARM_REG_R0];
+    *retval = modified_registers.aarch64.gpr[AARCH64_REG_X0];
 
   /*
    * Restore the registers and continue the process:
@@ -828,7 +825,15 @@ frida_find_library_base (pid_t pid, const gchar * library_name, gchar ** library
     if (res != 0)
       goto beach;
     path = debuginfo->path;
-
+    //x  PROT_NOCACHE     (0x00000800)
+    //x  PROT_EXEC        (0x00000400)
+    //x  PROT_WRITE       (0x00000200)
+    //x  PROT_READ        (0x00000100)
+    if((mapinfos[i].flags & 0x00000400) == 0x0){
+    	printf("[%03d]:[o][%lx][%x][%s]\n", i, mapinfos[i].vaddr, mapinfos[i].flags, path);
+    	continue;
+    }
+    printf("[%03d]:[x][%lx][%x][%s]\n", i, mapinfos[i].vaddr, mapinfos[i].flags, path);
     if (strcmp (path, library_name) == 0)
     {
       result = mapinfos[i].vaddr;
