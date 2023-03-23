@@ -1,8 +1,8 @@
 #include "frida-core.h"
 
 #include <gio/gunixinputstream.h>
-#include <gum/arch-arm/gumarmwriter.h>
-#include <gum/arch-arm/gumthumbwriter.h>
+#include <gum/arch-arm64/gumarm64writer.h>
+//#include <gum/arch-arm64/gumthumbwriter.h>
 #include <gum/gum.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -107,9 +107,11 @@ struct _FridaTrampolineData
   gchar so_path[256];
   gchar entrypoint_name[256];
   gchar entrypoint_data[256];
-
-  pthread_t worker_thread;
   gpointer module_handle;
+
+  unsigned long worker_thread;
+  long tid;
+  long conid;
 };
 
 struct _FridaFindLandingStripContext
@@ -131,6 +133,8 @@ static gboolean frida_remote_write_fd (gint fd, GumAddress remote_address, gcons
 static gboolean frida_remote_call (pid_t pid, GumAddress func, const GumAddress * args, gint args_length, GumAddress * retval, GError ** error);
 
 static GumAddress frida_resolve_remote_libc_function (int remote_pid, const gchar * function_name);
+static GumAddress frida_resolve_remote_ldqnx_function (int remote_pid, const gchar * function_name);
+
 
 static GumAddress frida_resolve_remote_library_function (int remote_pid, const gchar * library_name, const gchar * function_name);
 static GumAddress frida_find_library_base (pid_t pid, const gchar * library_name, gchar ** library_path);
@@ -245,11 +249,13 @@ _frida_qinjector_do_inject (FridaQinjector * self, guint pid, const gchar * path
     goto beach;
   instance->remote_payload = params.remote_address;
 
+  printf("attach %d\nb *0x%lx\n", pid, params.remote_address);
   if (!frida_emit_and_remote_execute (frida_emit_payload_code, &params, NULL, error))
     goto beach;
 
   gee_abstract_map_set (GEE_ABSTRACT_MAP (self->instances), GUINT_TO_POINTER (instance->id), instance);
 
+  //sleep(99999); 
   return instance->id;
 
 beach:
@@ -281,6 +287,8 @@ frida_emit_and_remote_execute (FridaEmitFunc func, const FridaInjectionParams * 
   if (!frida_remote_write (params->pid, params->remote_address, code.bytes, FRIDA_REMOTE_DATA_OFFSET + sizeof (FridaTrampolineData), error))
     return FALSE;
 
+  //sleep(10);
+
   /*
    * We need to flush the data cache and invalidate the instruction cache before
    * trying to run the generated code.
@@ -291,6 +299,7 @@ frida_emit_and_remote_execute (FridaEmitFunc func, const FridaInjectionParams * 
   if (frida_remote_pthread_create (params->pid, params->remote_address, error) != 0)
     return FALSE;
 
+  //sleep(10000);
   return TRUE;
 }
 
@@ -308,6 +317,8 @@ frida_emit_and_remote_execute (FridaEmitFunc func, const FridaInjectionParams * 
     gum_arm64_writer_put_ldr_reg_reg_offset (&cw, ARM64_REG_##dst, ARM64_REG_##src, 0)
 #define EMIT_LDR_U32(reg, value) \
     gum_arm64_writer_put_ldr_reg_u32 (&cw, ARM64_REG_##reg, value)
+#define EMIT_LDR_U64(reg, value) \
+    gum_arm64_writer_put_ldr_reg_u64 (&cw, ARM64_REG_##reg, value)
 #define EMIT_CALL_IMM(func, n_args, ...) \
     gum_arm64_writer_put_call_address_with_arguments (&cw, func, n_args, __VA_ARGS__)
 #define EMIT_CALL_REG(reg, n_args, ...) \
@@ -324,6 +335,52 @@ frida_emit_and_remote_execute (FridaEmitFunc func, const FridaInjectionParams * 
 #define ARG_REG(reg) \
     GUM_ARG_REGISTER, ARM64_REG_##reg
 
+#define EMIT_RET() \
+    gum_arm64_writer_put_ret (&cw)
+
+////////////////////////
+
+struct printf_context_t{
+	GumAddress printf_func_addr;
+	GumAddress format_ptr;
+	pid_t pid;
+};
+
+void remote_call_printf_init(struct printf_context_t *pc_handle, pid_t pid)
+{
+	GError * error;
+	pc_handle->printf_func_addr = frida_resolve_remote_libc_function (pid, "printf");
+	pc_handle->format_ptr = frida_remote_alloc(pid, 4096, PROT_READ | PROT_WRITE, &error);
+  printf("printf format str addr:%lx\n", pc_handle->format_ptr); 
+	pc_handle->pid = pid;
+
+	char format_str[] = "lius_remote_printf: %d\n";
+  frida_remote_write (pc_handle->pid, pc_handle->format_ptr, (gconstpointer)format_str, sizeof(format_str), &error);
+
+}
+
+void remote_call_printf_deinit(struct printf_context_t *pc_handle){
+	GError * error;
+	frida_remote_dealloc (pc_handle->pid, pc_handle->format_ptr, 4096, &error);
+}
+
+void remote_call_printf_exec(GumArm64Writer *cw, struct printf_context_t *pc_handle, int val)
+{
+#define MINE_EMIT_CALL_IMM(func, n_args, ...) \
+    gum_arm64_writer_put_call_address_with_arguments (cw, func, n_args, __VA_ARGS__)
+
+  gum_arm64_writer_put_ldr_reg_u64(cw, ARM64_REG_X9, pc_handle->format_ptr);
+  MINE_EMIT_CALL_IMM (frida_resolve_remote_libc_function (pc_handle->pid, "printf"),
+    2,
+    ARG_REG (X9),
+    ARG_IMM (val));
+
+#undef MINE_EMIT_CALL_IMM
+}
+
+////////////////////////
+
+
 static void
 frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_address, FridaCodeChunk * code)
 {
@@ -337,6 +394,16 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
   gum_arm64_writer_put_push_reg_reg(&cw, ARM64_REG_X5, ARM64_REG_X6);
   gum_arm64_writer_put_push_reg_reg(&cw, ARM64_REG_X7, ARM64_REG_LR);
 
+
+  // EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "sleep"),
+  //   1,
+  //   ARG_IMM (10)); 
+
+  // struct printf_context_t printf_context;
+	// remote_call_printf_init(&printf_context, params->pid);
+  //gum_arm64_writer_put_instruction(&cw, 0xD4200020);
+
+
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "ConnectAttach_r"),
       5,
       ARG_IMM (ND_LOCAL_NODE),
@@ -345,23 +412,27 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
       ARG_IMM (_NTO_SIDE_CHANNEL),
       ARG_IMM (_NTO_COF_CLOEXEC));
   EMIT_MOVE (X7, X0);
+  EMIT_STORE_FIELD (conid, X7);
 
   gum_arm64_writer_put_call_address_with_arguments (&cw, frida_resolve_remote_libc_function (params->pid, "gettid"), 0);
   EMIT_MOVE (X3, X0);
+  EMIT_STORE_FIELD (tid, X3);
 
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "MsgSendPulse_r"),
       4,
       ARG_REG (X7),
       ARG_IMM (-1),
-      ARG_IMM (FRIDA_QNX_PULSE_CODE_HELLO),
+      ARG_IMM (FRIDA_QNX_PULSE_CODE_HELLO), 
       ARG_REG (X3));
+
+  //remote_call_printf_exec(&cw, &printf_context, 1);
 
   EMIT_LOAD_FIELD (X6, module_handle);
   //EMIT_CMP (R6, 0);
   EMIT_CMP (X6, XZR);
   EMIT_B_COND (NE, skip_dlopen);
   {
-    EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlopen"),
+    EMIT_CALL_IMM (frida_resolve_remote_ldqnx_function (params->pid, "dlopen"),
         2,
         ARG_IMM (FRIDA_REMOTE_DATA_FIELD (so_path)),
         ARG_IMM (RTLD_LAZY));
@@ -370,13 +441,17 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
   }
   EMIT_LABEL (skip_dlopen);
 
-  EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlsym"),
+  //remote_call_printf_exec(&cw, &printf_context, 2);
+
+  EMIT_CALL_IMM (frida_resolve_remote_ldqnx_function (params->pid, "dlsym"),
       2,
       ARG_REG (X6),
       ARG_IMM (FRIDA_REMOTE_DATA_FIELD (entrypoint_name)));
   gum_arm64_writer_put_mov_reg_reg (&cw, ARM64_REG_X5, ARM64_REG_X0);
 
-  EMIT_LDR_U32 (X0, FRIDA_UNLOAD_POLICY_IMMEDIATE);
+  //remote_call_printf_exec(&cw, &printf_context, 3);
+
+  EMIT_LDR_U64 (X0, FRIDA_UNLOAD_POLICY_IMMEDIATE);
   gum_arm64_writer_put_push_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X7);
   EMIT_MOVE (X1, SP);
   EMIT_ADD (X2, SP, 4);
@@ -386,19 +461,25 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
       ARG_REG (X1),
       ARG_REG (X2));
 
+  //remote_call_printf_exec(&cw, &printf_context, 4);
+
   EMIT_LDR (X0, SP);
-  EMIT_LDR_U32 (X2, FRIDA_UNLOAD_POLICY_IMMEDIATE);
+  EMIT_LDR_U64 (X2, FRIDA_UNLOAD_POLICY_IMMEDIATE);
   EMIT_CMP (X0, X2);
   EMIT_B_COND (NE, skip_dlclose);
   {
-    EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "dlclose"),
+    EMIT_LOAD_FIELD (X6, module_handle);
+    EMIT_CALL_IMM (frida_resolve_remote_ldqnx_function (params->pid, "dlclose"),
         1,
         ARG_REG (X6));
+    //remote_call_printf_exec(&cw, &printf_context, 5555);
   }
   EMIT_LABEL (skip_dlclose);
 
+  //remote_call_printf_exec(&cw, &printf_context, 5);
+
   EMIT_LDR (X0, SP);
-  EMIT_LDR_U32 (X2, FRIDA_UNLOAD_POLICY_DEFERRED);
+  EMIT_LDR_U64 (X2, FRIDA_UNLOAD_POLICY_DEFERRED);
   EMIT_CMP (X0, X2);
   EMIT_B_COND (EQ, skip_detach);
   {
@@ -409,7 +490,10 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
   }
   EMIT_LABEL (skip_detach);
 
-  EMIT_LDR (X3, SP);
+  //remote_call_printf_exec(&cw, &printf_context, 6);
+
+  EMIT_LOAD_FIELD (X7, conid);
+  EMIT_LOAD_FIELD (X3, tid);
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "MsgSendPulse_r"),
       4,
       ARG_REG (X7),
@@ -417,14 +501,24 @@ frida_emit_payload_code (const FridaInjectionParams * params, GumAddress remote_
       ARG_IMM (FRIDA_QNX_PULSE_CODE_BYE),
       ARG_REG (X3));
 
+  //remote_call_printf_exec(&cw, &printf_context, 7);
+
   EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "ConnectDetach_r"),
       1,
       ARG_REG (X7));
+
+  //remote_call_printf_exec(&cw, &printf_context, 8);
 
   gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X0, ARM64_REG_X7);
 
   gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X7, ARM64_REG_LR);
   gum_arm64_writer_put_pop_reg_reg (&cw, ARM64_REG_X5, ARM64_REG_X6);
+
+  //remote_call_printf_exec(&cw, &printf_context, 9);
+  //EMIT_RET ();
+  EMIT_CALL_IMM (frida_resolve_remote_libc_function (params->pid, "pthread_exit"),
+      1,
+      ARG_IMM (0));
 
   gum_arm64_writer_flush (&cw);
   code->cur = gum_arm64_writer_cur (&cw);
@@ -746,6 +840,12 @@ frida_resolve_remote_libc_function (int remote_pid, const gchar * function_name)
 }
 
 static GumAddress
+frida_resolve_remote_ldqnx_function (int remote_pid, const gchar * function_name)
+{
+  return frida_resolve_remote_library_function (remote_pid, "ldqnx-64", function_name);
+}
+
+static GumAddress
 frida_resolve_remote_library_function (int remote_pid, const gchar * library_name, const gchar * function_name)
 {
   gchar * local_library_path, * remote_library_path, * canonical_library_name;
@@ -764,21 +864,27 @@ frida_resolve_remote_library_function (int remote_pid, const gchar * library_nam
 
   g_assert (g_strcmp0 (local_library_path, remote_library_path) == 0);
 
-  canonical_library_name = g_path_get_basename (local_library_path);
+  //canonical_library_name = g_path_get_basename (local_library_path);
 
-  module = dlopen (canonical_library_name, RTLD_GLOBAL | RTLD_LAZY);
+  //module = dlopen (canonical_library_name, RTLD_GLOBAL | RTLD_LAZY);
+
+  module = dlopen (local_library_path, RTLD_GLOBAL | RTLD_LAZY);
   g_assert (module != NULL);
 
   local_address = dlsym (module, function_name);
   g_assert (local_address != NULL);
 
+  //printf("function_name:%s, local_base:%lx,  remote_base:%lx, local_address:%p\n", function_name, local_base, remote_base, local_address);
+
   remote_address = remote_base + (GUM_ADDRESS (local_address) - local_base);
+
+  //printf("********remote_address:%lx********\n", remote_address);
 
   dlclose (module);
 
   g_free (local_library_path);
   g_free (remote_library_path);
-  g_free (canonical_library_name);
+  //g_free (canonical_library_name);
 
   return remote_address;
 }
@@ -830,10 +936,10 @@ frida_find_library_base (pid_t pid, const gchar * library_name, gchar ** library
     //x  PROT_WRITE       (0x00000200)
     //x  PROT_READ        (0x00000100)
     if((mapinfos[i].flags & 0x00000400) == 0x0){
-    	printf("[%03d]:[o][%lx][%x][%s]\n", i, mapinfos[i].vaddr, mapinfos[i].flags, path);
+    	//printf("[%d][%03d]:[o][%lx][%x][%s]\n", pid, i, mapinfos[i].vaddr, mapinfos[i].flags, path);
     	continue;
     }
-    printf("[%03d]:[x][%lx][%x][%s]\n", i, mapinfos[i].vaddr, mapinfos[i].flags, path);
+    //printf("[%d][%03d]:[x][%lx][%x][%s]\n", pid, i, mapinfos[i].vaddr, mapinfos[i].flags, path);
     if (strcmp (path, library_name) == 0)
     {
       result = mapinfos[i].vaddr;
